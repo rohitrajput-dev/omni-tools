@@ -3,5 +3,16 @@ import react from '@vitejs/plugin-react';
 import tailwindcss from '@tailwindcss/vite';
 
 export default defineConfig({
-  plugins: [react(), tailwindcss()],
+  plugins: [
+    react(),
+    tailwindcss(),
+  ],
+  build: {
+    target: 'esnext', // Allows modern JS features used by pdfjs-dist
+  },
+  optimizeDeps: {
+    esbuildOptions: {
+      target: 'esnext',
+    },
+  },
 });
