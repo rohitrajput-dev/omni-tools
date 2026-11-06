@@ -12,7 +12,7 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
 
 export default function PdfCompressor() {
   const [file, setFile] = useState(null);
-  const [compressionRate, setCompressionRate] = useState(50); // 10% to 90%
+  const [compressionRate, setCompressionRate] = useState(70); // 10% to 90%
   const [isProcessing, setIsProcessing] = useState(false);
   const [progress, setProgress] = useState(0);
   const [result, setResult] = useState(null);
@@ -35,7 +35,7 @@ export default function PdfCompressor() {
     setErrorMsg(null);
   };
 
-  // 1. Lossless metadata and object-stream compression
+  // 1. Lossless metadata/stream compression
   const compressLossless = async (buffer) => {
     try {
       const pdfDoc = await PDFDocument.load(buffer, { ignoreEncryption: true });
@@ -50,67 +50,86 @@ export default function PdfCompressor() {
     }
   };
 
-  // 2. Budget-driven canvas rasterizer
-  const compressWithBudget = async (buffer, targetBytes) => {
+  // 2. Calibrated Rasterizer that forces the target size
+  const compressWithCalibration = async (buffer, targetBytes) => {
     const pdf = await pdfjsLib.getDocument({ data: buffer }).promise;
     const totalPages = pdf.numPages;
 
-    // Calculate maximum allowable bytes per page to meet user target
-    const bytesPerPage = targetBytes / totalPages;
+    // Target remaining fraction (e.g., 70% compression = 0.30 target remaining)
+    const targetRemaining = Math.max(0.08, 1 - compressionRate / 100);
 
-    // Dynamically adjust scale & quality based on per-page budget
-    let scale = 1.0;
-    let quality = 0.6;
+    // Initial estimation: pixel count scales quadratically with scale
+    let scale = Math.max(0.35, Math.min(1.0, Math.sqrt(targetRemaining) * 0.9));
+    let quality = Math.max(0.15, Math.min(0.8, targetRemaining * 0.7 + 0.15));
 
-    if (bytesPerPage < 35 * 1024) {
-      // Strict budget (<35KB/page): aggressive downscaling
-      scale = 0.55;
-      quality = 0.25;
-    } else if (bytesPerPage < 70 * 1024) {
-      // Moderate budget (35KB - 70KB/page)
-      scale = 0.75;
-      quality = 0.45;
-    } else {
-      // Generous budget (>70KB/page)
-      scale = 0.95;
-      quality = 0.65;
-    }
+    // --- STEP 1: CALIBRATE WITH PAGE 1 ---
+    const page1 = await pdf.getPage(1);
+    let viewport = page1.getViewport({ scale });
+    let canvas = document.createElement('canvas');
+    let ctx = canvas.getContext('2d');
+    canvas.width = viewport.width;
+    canvas.height = viewport.height;
 
-    let newPdf = null;
+    await page1.render({ canvasContext: ctx, viewport }).promise;
+    let imgData = canvas.toDataURL('image/jpeg', quality);
 
-    for (let pageNum = 1; pageNum <= totalPages; pageNum++) {
-      const page = await pdf.getPage(pageNum);
-      const viewport = page.getViewport({ scale });
+    // Measure approximate binary bytes from Base64 (len * 0.75) + ~1KB jsPDF dictionary overhead
+    let samplePageBytes = (imgData.length - 23) * 0.75 + 1024;
+    let projectedTotal = samplePageBytes * totalPages;
 
-      const canvas = document.createElement('canvas');
-      const ctx = canvas.getContext('2d');
+    // Calculate how far the estimate is from targetBytes
+    const correctionFactor = targetBytes / projectedTotal;
+
+    // If estimate is off by more than 10%, recalibrate parameters and re-render Page 1
+    if (Math.abs(1 - correctionFactor) > 0.1) {
+      scale = Math.max(0.3, Math.min(1.0, scale * Math.sqrt(correctionFactor)));
+      quality = Math.max(0.12, Math.min(0.85, quality * Math.pow(correctionFactor, 0.4)));
+
+      viewport = page1.getViewport({ scale });
       canvas.width = viewport.width;
       canvas.height = viewport.height;
+      await page1.render({ canvasContext: ctx, viewport }).promise;
+      imgData = canvas.toDataURL('image/jpeg', quality);
+    }
+
+    // --- STEP 2: BUILD PDF USING CALIBRATED SETTINGS ---
+    let newPdf = null;
+    const unscaledVp1 = page1.getViewport({ scale: 1.0 });
+    const widthPt1 = unscaledVp1.width;
+    const heightPt1 = unscaledVp1.height;
+    const orientation1 = widthPt1 > heightPt1 ? 'landscape' : 'portrait';
+
+    newPdf = new jsPDF({
+      orientation: orientation1,
+      unit: 'pt',
+      format: [widthPt1, heightPt1],
+      compress: true,
+    });
+    newPdf.addImage(imgData, 'JPEG', 0, 0, widthPt1, heightPt1, undefined, 'FAST');
+    setProgress(Math.round((1 / totalPages) * 100));
+
+    // Process remaining pages
+    for (let pageNum = 2; pageNum <= totalPages; pageNum++) {
+      const page = await pdf.getPage(pageNum);
+      const pageVp = page.getViewport({ scale });
+
+      canvas.width = pageVp.width;
+      canvas.height = pageVp.height;
 
       await page.render({
         canvasContext: ctx,
-        viewport: viewport,
+        viewport: pageVp,
       }).promise;
 
-      const imgData = canvas.toDataURL('image/jpeg', quality);
+      const pageImgData = canvas.toDataURL('image/jpeg', quality);
 
-      const unscaledViewport = page.getViewport({ scale: 1.0 });
-      const widthPt = unscaledViewport.width;
-      const heightPt = unscaledViewport.height;
+      const unscaledVp = page.getViewport({ scale: 1.0 });
+      const widthPt = unscaledVp.width;
+      const heightPt = unscaledVp.height;
       const orientation = widthPt > heightPt ? 'landscape' : 'portrait';
 
-      if (pageNum === 1) {
-        newPdf = new jsPDF({
-          orientation,
-          unit: 'pt',
-          format: [widthPt, heightPt],
-          compress: true,
-        });
-      } else {
-        newPdf.addPage([widthPt, heightPt], orientation);
-      }
-
-      newPdf.addImage(imgData, 'JPEG', 0, 0, widthPt, heightPt, undefined, 'FAST');
+      newPdf.addPage([widthPt, heightPt], orientation);
+      newPdf.addImage(pageImgData, 'JPEG', 0, 0, widthPt, heightPt, undefined, 'FAST');
       setProgress(Math.round((pageNum / totalPages) * 100));
     }
 
@@ -128,31 +147,27 @@ export default function PdfCompressor() {
 
       const buffer = await file.arrayBuffer();
 
-      // Run lossless and budget rasterizer concurrently
-      const [losslessBlob, rasterBlob] = await Promise.all([
+      const [losslessBlob, calibratedBlob] = await Promise.all([
         compressLossless(buffer),
-        compressWithBudget(buffer, targetSize),
+        compressWithCalibration(buffer, targetSize),
       ]);
 
-      // Filter options that actually achieved compression
-      const validOptions = [];
+      const candidates = [];
       if (losslessBlob && losslessBlob.size < file.size) {
-        validOptions.push(losslessBlob);
+        candidates.push(losslessBlob);
       }
-      if (rasterBlob && rasterBlob.size < file.size) {
-        validOptions.push(rasterBlob);
+      if (calibratedBlob && calibratedBlob.size < file.size) {
+        candidates.push(calibratedBlob);
       }
 
-      if (validOptions.length === 0) {
-        setErrorMsg(
-          `Unable to compress further. The document is already at maximum optimization (${formatSize(file.size)}).`
-        );
+      if (candidates.length === 0) {
+        setErrorMsg(`Your document is already at maximum optimization (${formatSize(file.size)}).`);
         return;
       }
 
-      // Pick whichever candidate came closest to (or below) the user's target size
-      validOptions.sort((a, b) => Math.abs(a.size - targetSize) - Math.abs(b.size - targetSize));
-      const bestBlob = validOptions[0];
+      // Pick whichever candidate is closest to the target size requested by the slider
+      candidates.sort((a, b) => Math.abs(a.size - targetSize) - Math.abs(b.size - targetSize));
+      const bestBlob = candidates[0];
 
       setResult({
         blobUrl: URL.createObjectURL(bestBlob),
@@ -161,7 +176,7 @@ export default function PdfCompressor() {
       });
     } catch (err) {
       console.error(err);
-      setErrorMsg('Compression failed. Please ensure the PDF is not encrypted.');
+      setErrorMsg('Compression failed. Please ensure the document is not password-protected.');
     } finally {
       setIsProcessing(false);
     }
@@ -174,7 +189,6 @@ export default function PdfCompressor() {
       category="Compressors"
     >
       <div className="space-y-6">
-        {/* Upload Zone */}
         <label className="border-2 border-dashed border-slate-300 rounded-xl p-8 text-center flex flex-col items-center justify-center hover:border-indigo-500 transition cursor-pointer bg-white">
           <UploadCloud className="w-10 h-10 text-slate-400 mb-2" />
           <span className="font-semibold text-slate-700">Select PDF document to compress</span>
@@ -187,26 +201,24 @@ export default function PdfCompressor() {
           />
         </label>
 
-        {/* File Card */}
         {file && (
           <div className="p-4 bg-slate-50 border border-slate-200 rounded-lg flex items-center justify-between">
             <div className="flex items-center gap-3">
               <FileText className="w-6 h-6 text-indigo-600 shrink-0" />
               <div>
                 <p className="font-semibold text-sm text-slate-800 truncate max-w-xs">{file.name}</p>
-                <p className="text-xs text-slate-500">Current Size: {formatSize(file.size)}</p>
+                <p className="text-xs text-slate-500">Original Size: {formatSize(file.size)}</p>
               </div>
             </div>
             {result && <CheckCircle2 className="w-5 h-5 text-emerald-600 shrink-0" />}
           </div>
         )}
 
-        {/* Compression Goal Slider */}
         <div className="p-5 bg-white border border-slate-200 rounded-xl space-y-4 shadow-sm">
           <div className="flex justify-between items-center">
             <div className="flex items-center gap-2">
               <Sliders className="w-4 h-4 text-indigo-600" />
-              <label className="text-sm font-semibold text-slate-700">Compression Goal</label>
+              <label className="text-sm font-semibold text-slate-700">Compression Strength</label>
             </div>
             <span className="text-sm font-bold text-indigo-600 bg-indigo-50 px-2.5 py-0.5 rounded-full">
               {compressionRate}% reduction
@@ -242,7 +254,6 @@ export default function PdfCompressor() {
           </div>
         </div>
 
-        {/* Compress Button */}
         <button
           type="button"
           disabled={!file || isProcessing}
@@ -259,7 +270,6 @@ export default function PdfCompressor() {
           )}
         </button>
 
-        {/* Notice if already minimal */}
         {errorMsg && (
           <div className="p-3 bg-amber-50 border border-amber-200 rounded-lg text-amber-800 text-xs flex items-center gap-2">
             <AlertCircle className="w-4 h-4 shrink-0 text-amber-600" />
@@ -267,7 +277,6 @@ export default function PdfCompressor() {
           </div>
         )}
 
-        {/* Result Card */}
         {result && (
           <div className="p-4 bg-emerald-50 border border-emerald-200 rounded-xl space-y-3">
             <div className="flex justify-between items-center text-sm">
