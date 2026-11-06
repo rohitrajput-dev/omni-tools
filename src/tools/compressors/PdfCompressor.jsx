@@ -5,7 +5,7 @@ import * as pdfjsLib from 'pdfjs-dist';
 import { jsPDF } from 'jspdf';
 import { PDFDocument } from 'pdf-lib';
 
-// Vite-native worker configuration
+// Vite-native worker configurationg
 pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
   'pdfjs-dist/build/pdf.worker.min.mjs',
   import.meta.url
