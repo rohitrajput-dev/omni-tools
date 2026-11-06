@@ -1,11 +1,10 @@
 import { useState } from 'react';
 import ToolLayout from '../../components/ToolsLayout';
-import { UploadCloud, FileText, CheckCircle2, Loader2, Download, Sliders, ShieldCheck, AlertCircle } from 'lucide-react';
+import { UploadCloud, FileText, CheckCircle2, Loader2, Download, Sliders, AlertCircle } from 'lucide-react';
 import * as pdfjsLib from 'pdfjs-dist';
 import { jsPDF } from 'jspdf';
 import { PDFDocument } from 'pdf-lib';
 
-// Vite-native worker configurationg
 pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
   'pdfjs-dist/build/pdf.worker.min.mjs',
   import.meta.url
@@ -17,51 +16,65 @@ export default function PdfCompressor() {
   const [isProcessing, setIsProcessing] = useState(false);
   const [progress, setProgress] = useState(0);
   const [result, setResult] = useState(null);
-  const [notice, setNotice] = useState(null);
+  const [errorMsg, setErrorMsg] = useState(null);
 
   const formatSize = (bytes) => {
-    if (!bytes || bytes === 0) return '0 B';
+    if (!bytes || bytes <= 0) return '0 B';
     const k = 1024;
     const sizes = ['B', 'KB', 'MB', 'GB'];
     const i = Math.floor(Math.log(bytes) / Math.log(k));
     return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
   };
 
-  // Real-time estimated size preview
-  const estimatedSize = file ? Math.round(file.size * (1 - compressionRate / 100)) : 0;
+  const targetSize = file ? Math.round(file.size * (1 - compressionRate / 100)) : 0;
 
   const handleFileChange = (e) => {
     const selected = e.target.files?.[0] || null;
     setFile(selected);
     setResult(null);
-    setNotice(null);
+    setErrorMsg(null);
   };
 
-  // Engine 1: Lossless structural stream compression (Best for text/vectors)
-  const compressLossless = async (arrayBuffer) => {
+  // 1. Lossless metadata and object-stream compression
+  const compressLossless = async (buffer) => {
     try {
-      const pdfDoc = await PDFDocument.load(arrayBuffer, { ignoreEncryption: true });
+      const pdfDoc = await PDFDocument.load(buffer, { ignoreEncryption: true });
       pdfDoc.setTitle('');
       pdfDoc.setAuthor('');
       pdfDoc.setProducer('');
       pdfDoc.setCreator('');
-
-      const savedBytes = await pdfDoc.save({ useObjectStreams: true });
-      return new Blob([savedBytes], { type: 'application/pdf' });
+      const bytes = await pdfDoc.save({ useObjectStreams: true });
+      return new Blob([bytes], { type: 'application/pdf' });
     } catch {
       return null;
     }
   };
 
-  // Engine 2: Canvas downsampling (Best for scanned docs & photos)
-  const compressRaster = async (arrayBuffer) => {
-    const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+  // 2. Budget-driven canvas rasterizer
+  const compressWithBudget = async (buffer, targetBytes) => {
+    const pdf = await pdfjsLib.getDocument({ data: buffer }).promise;
     const totalPages = pdf.numPages;
 
-    // Strict scaling based on slider to prevent image bloat
-    const factor = compressionRate / 100;
-    const quality = Math.max(0.15, 0.75 - factor * 0.55); // 0.70 down to 0.20
-    const scale = Math.max(0.5, 1.1 - factor * 0.6);      // 1.05 down to 0.50
+    // Calculate maximum allowable bytes per page to meet user target
+    const bytesPerPage = targetBytes / totalPages;
+
+    // Dynamically adjust scale & quality based on per-page budget
+    let scale = 1.0;
+    let quality = 0.6;
+
+    if (bytesPerPage < 35 * 1024) {
+      // Strict budget (<35KB/page): aggressive downscaling
+      scale = 0.55;
+      quality = 0.25;
+    } else if (bytesPerPage < 70 * 1024) {
+      // Moderate budget (35KB - 70KB/page)
+      scale = 0.75;
+      quality = 0.45;
+    } else {
+      // Generous budget (>70KB/page)
+      scale = 0.95;
+      quality = 0.65;
+    }
 
     let newPdf = null;
 
@@ -97,11 +110,11 @@ export default function PdfCompressor() {
         newPdf.addPage([widthPt, heightPt], orientation);
       }
 
-      newPdf.addImage(imgData, 'JPEG', 0, 0, widthPt, heightPt, undefined, 'SLOW');
+      newPdf.addImage(imgData, 'JPEG', 0, 0, widthPt, heightPt, undefined, 'FAST');
       setProgress(Math.round((pageNum / totalPages) * 100));
     }
 
-    return newPdf ? newPdf.output('blob') : null;
+    return newPdf.output('blob');
   };
 
   const handleCompress = async () => {
@@ -109,46 +122,46 @@ export default function PdfCompressor() {
 
     try {
       setIsProcessing(true);
-      setProgress(10);
+      setProgress(5);
       setResult(null);
-      setNotice(null);
+      setErrorMsg(null);
 
       const buffer = await file.arrayBuffer();
 
-      // Run both engines
+      // Run lossless and budget rasterizer concurrently
       const [losslessBlob, rasterBlob] = await Promise.all([
         compressLossless(buffer),
-        compressRaster(buffer),
+        compressWithBudget(buffer, targetSize),
       ]);
 
-      // Collect all candidates smaller than original
-      const candidates = [];
+      // Filter options that actually achieved compression
+      const validOptions = [];
       if (losslessBlob && losslessBlob.size < file.size) {
-        candidates.push({ blob: losslessBlob, type: 'lossless' });
+        validOptions.push(losslessBlob);
       }
       if (rasterBlob && rasterBlob.size < file.size) {
-        candidates.push({ blob: rasterBlob, type: 'raster' });
+        validOptions.push(rasterBlob);
       }
 
-      // Pick whichever engine produced the smallest file
-      candidates.sort((a, b) => a.blob.size - b.blob.size);
-
-      if (candidates.length > 0) {
-        const best = candidates[0];
-        setResult({
-          blobUrl: URL.createObjectURL(best.blob),
-          size: best.blob.size,
-          fileName: file.name.replace(/\.pdf$/i, '_compressed.pdf'),
-        });
-      } else {
-        // If neither method could beat the original size, the file is already at maximum optimization
-        setNotice(
-          `Your PDF is already at optimal size (${formatSize(file.size)}). Because it contains clean digital text without bulky images, further compression would degrade visual quality without saving disk space.`
+      if (validOptions.length === 0) {
+        setErrorMsg(
+          `Unable to compress further. The document is already at maximum optimization (${formatSize(file.size)}).`
         );
+        return;
       }
+
+      // Pick whichever candidate came closest to (or below) the user's target size
+      validOptions.sort((a, b) => Math.abs(a.size - targetSize) - Math.abs(b.size - targetSize));
+      const bestBlob = validOptions[0];
+
+      setResult({
+        blobUrl: URL.createObjectURL(bestBlob),
+        size: bestBlob.size,
+        fileName: file.name.replace(/\.pdf$/i, '_compressed.pdf'),
+      });
     } catch (err) {
       console.error(err);
-      alert('Unable to process PDF. Verify the file is not password-protected.');
+      setErrorMsg('Compression failed. Please ensure the PDF is not encrypted.');
     } finally {
       setIsProcessing(false);
     }
@@ -161,7 +174,7 @@ export default function PdfCompressor() {
       category="Compressors"
     >
       <div className="space-y-6">
-        {/* File Dropzone */}
+        {/* Upload Zone */}
         <label className="border-2 border-dashed border-slate-300 rounded-xl p-8 text-center flex flex-col items-center justify-center hover:border-indigo-500 transition cursor-pointer bg-white">
           <UploadCloud className="w-10 h-10 text-slate-400 mb-2" />
           <span className="font-semibold text-slate-700">Select PDF document to compress</span>
@@ -174,33 +187,32 @@ export default function PdfCompressor() {
           />
         </label>
 
-        {/* Selected File Details */}
+        {/* File Card */}
         {file && (
           <div className="p-4 bg-slate-50 border border-slate-200 rounded-lg flex items-center justify-between">
             <div className="flex items-center gap-3">
               <FileText className="w-6 h-6 text-indigo-600 shrink-0" />
               <div>
                 <p className="font-semibold text-sm text-slate-800 truncate max-w-xs">{file.name}</p>
-                <p className="text-xs text-slate-500">Original Size: {formatSize(file.size)}</p>
+                <p className="text-xs text-slate-500">Current Size: {formatSize(file.size)}</p>
               </div>
             </div>
             {result && <CheckCircle2 className="w-5 h-5 text-emerald-600 shrink-0" />}
           </div>
         )}
 
-        {/* Interactive Compression Slider */}
+        {/* Compression Goal Slider */}
         <div className="p-5 bg-white border border-slate-200 rounded-xl space-y-4 shadow-sm">
           <div className="flex justify-between items-center">
             <div className="flex items-center gap-2">
               <Sliders className="w-4 h-4 text-indigo-600" />
-              <label className="text-sm font-semibold text-slate-700">Target Compression Rate</label>
+              <label className="text-sm font-semibold text-slate-700">Compression Goal</label>
             </div>
             <span className="text-sm font-bold text-indigo-600 bg-indigo-50 px-2.5 py-0.5 rounded-full">
-              {compressionRate}%
+              {compressionRate}% reduction
             </span>
           </div>
 
-          {/* Standard cross-browser range slider (without appearance-none) */}
           <input
             type="range"
             min="10"
@@ -211,31 +223,26 @@ export default function PdfCompressor() {
             onChange={(e) => {
               setCompressionRate(Number(e.target.value));
               setResult(null);
-              setNotice(null);
+              setErrorMsg(null);
             }}
             className="w-full h-2 bg-slate-200 rounded-lg cursor-pointer accent-indigo-600"
           />
 
           <div className="flex justify-between text-xs text-slate-400">
-            <span>Low (10%)</span>
+            <span>Light (10%)</span>
             <span>Balanced (50%)</span>
-            <span>Extreme (90%)</span>
+            <span>Maximum (90%)</span>
           </div>
 
           <div className="pt-3 border-t border-slate-100 flex items-center justify-between text-sm">
-            <span className="text-slate-600">Estimated Target Size:</span>
+            <span className="text-slate-600">Target Output Size:</span>
             <span className="font-semibold text-slate-800">
-              {file ? `~${formatSize(estimatedSize)}` : '--'}
-              {file && (
-                <span className="text-xs text-emerald-600 font-normal ml-1">
-                  (-{compressionRate}%)
-                </span>
-              )}
+              {file ? `~${formatSize(targetSize)}` : '--'}
             </span>
           </div>
         </div>
 
-        {/* Compress Action Button */}
+        {/* Compress Button */}
         <button
           type="button"
           disabled={!file || isProcessing}
@@ -252,22 +259,19 @@ export default function PdfCompressor() {
           )}
         </button>
 
-        {/* Notice when the file is already optimal */}
-        {notice && (
-          <div className="p-4 bg-blue-50 border border-blue-200 rounded-xl text-blue-900 text-sm flex items-start gap-3">
-            <ShieldCheck className="w-5 h-5 text-blue-600 shrink-0 mt-0.5" />
-            <div>
-              <p className="font-semibold mb-0.5">Already Optimized</p>
-              <p className="text-blue-700 text-xs leading-relaxed">{notice}</p>
-            </div>
+        {/* Notice if already minimal */}
+        {errorMsg && (
+          <div className="p-3 bg-amber-50 border border-amber-200 rounded-lg text-amber-800 text-xs flex items-center gap-2">
+            <AlertCircle className="w-4 h-4 shrink-0 text-amber-600" />
+            <span>{errorMsg}</span>
           </div>
         )}
 
-        {/* Download Results Card */}
+        {/* Result Card */}
         {result && (
           <div className="p-4 bg-emerald-50 border border-emerald-200 rounded-xl space-y-3">
             <div className="flex justify-between items-center text-sm">
-              <span className="text-emerald-900 font-medium">New Compressed Size:</span>
+              <span className="text-emerald-900 font-medium">Actual Result:</span>
               <span className="font-bold text-emerald-700">
                 {formatSize(result.size)}
                 <span className="ml-2 font-normal text-xs text-emerald-600">
