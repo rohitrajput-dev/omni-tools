@@ -12,7 +12,7 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
 
 export default function PdfCompressor() {
   const [file, setFile] = useState(null);
-  const [compressionRate, setCompressionRate] = useState(70);
+  const [compressionRate, setCompressionRate] = useState(70); // 10% to 90%
   const [isProcessing, setIsProcessing] = useState(false);
   const [progress, setProgress] = useState(0);
   const [result, setResult] = useState(null);
@@ -35,6 +35,7 @@ export default function PdfCompressor() {
     setErrorMsg(null);
   };
 
+  // 1. Lossless metadata/stream compression
   const compressLossless = async (buffer) => {
     try {
       const pdfDoc = await PDFDocument.load(buffer, { ignoreEncryption: true });
@@ -49,20 +50,19 @@ export default function PdfCompressor() {
     }
   };
 
-  // Continuous uniform compression engine
-  const compressContinuous = async (buffer, targetBytes) => {
+  // 2. Calibrated Rasterizer that forces the target size
+  const compressWithCalibration = async (buffer, targetBytes) => {
     const pdf = await pdfjsLib.getDocument({ data: buffer }).promise;
     const totalPages = pdf.numPages;
 
-    // Remaining ratio: e.g. 70% compression = 0.30 target remaining
-    const remainingRatio = Math.max(0.05, 1 - compressionRate / 100);
+    // Target remaining fraction (e.g., 70% compression = 0.30 target remaining)
+    const targetRemaining = Math.max(0.08, 1 - compressionRate / 100);
 
-    // Continuous formulas (no discrete tiers or sudden jumps)
-    // Pixel count scales with scale^2, so scale scales with sqrt(ratio)
-    let scale = Math.max(0.35, Math.min(1.0, Math.sqrt(remainingRatio) * 0.95));
-    let quality = Math.max(0.15, Math.min(0.85, Math.pow(remainingRatio, 0.45) * 0.75));
+    // Initial estimation: pixel count scales quadratically with scale
+    let scale = Math.max(0.35, Math.min(1.0, Math.sqrt(targetRemaining) * 0.9));
+    let quality = Math.max(0.15, Math.min(0.8, targetRemaining * 0.7 + 0.15));
 
-    // Sample Page 1 to detect document image density
+    // --- STEP 1: CALIBRATE WITH PAGE 1 ---
     const page1 = await pdf.getPage(1);
     let viewport = page1.getViewport({ scale });
     let canvas = document.createElement('canvas');
@@ -73,31 +73,26 @@ export default function PdfCompressor() {
     await page1.render({ canvasContext: ctx, viewport }).promise;
     let imgData = canvas.toDataURL('image/jpeg', quality);
 
-    // Approximate bytes from Base64
-    const sampleBytes = (imgData.length - 23) * 0.75 + 1500;
-    const projectedTotal = sampleBytes * totalPages;
+    // Measure approximate binary bytes from Base64 (len * 0.75) + ~1KB jsPDF dictionary overhead
+    let samplePageBytes = (imgData.length - 23) * 0.75 + 1024;
+    let projectedTotal = samplePageBytes * totalPages;
 
-    // If the document is denser/lighter than expected, apply a smooth global correction factor
-    if (projectedTotal > 0 && targetBytes > 0) {
-      const correction = targetBytes / projectedTotal;
-      if (correction < 0.9 || correction > 1.1) {
-        // Smooth dampening to avoid overshooting
-        const dampenedScaleFactor = Math.pow(correction, 0.4);
-        const dampenedQualityFactor = Math.pow(correction, 0.3);
+    // Calculate how far the estimate is from targetBytes
+    const correctionFactor = targetBytes / projectedTotal;
 
-        scale = Math.max(0.3, Math.min(1.0, scale * dampenedScaleFactor));
-        quality = Math.max(0.12, Math.min(0.85, quality * dampenedQualityFactor));
+    // If estimate is off by more than 10%, recalibrate parameters and re-render Page 1
+    if (Math.abs(1 - correctionFactor) > 0.1) {
+      scale = Math.max(0.3, Math.min(1.0, scale * Math.sqrt(correctionFactor)));
+      quality = Math.max(0.12, Math.min(0.85, quality * Math.pow(correctionFactor, 0.4)));
 
-        // Re-render Page 1 with globally calibrated values
-        viewport = page1.getViewport({ scale });
-        canvas.width = viewport.width;
-        canvas.height = viewport.height;
-        await page1.render({ canvasContext: ctx, viewport }).promise;
-        imgData = canvas.toDataURL('image/jpeg', quality);
-      }
+      viewport = page1.getViewport({ scale });
+      canvas.width = viewport.width;
+      canvas.height = viewport.height;
+      await page1.render({ canvasContext: ctx, viewport }).promise;
+      imgData = canvas.toDataURL('image/jpeg', quality);
     }
 
-    // Uniformly render all pages with calibrated (scale, quality)
+    // --- STEP 2: BUILD PDF USING CALIBRATED SETTINGS ---
     let newPdf = null;
     const unscaledVp1 = page1.getViewport({ scale: 1.0 });
     const widthPt1 = unscaledVp1.width;
@@ -113,6 +108,7 @@ export default function PdfCompressor() {
     newPdf.addImage(imgData, 'JPEG', 0, 0, widthPt1, heightPt1, undefined, 'FAST');
     setProgress(Math.round((1 / totalPages) * 100));
 
+    // Process remaining pages
     for (let pageNum = 2; pageNum <= totalPages; pageNum++) {
       const page = await pdf.getPage(pageNum);
       const pageVp = page.getViewport({ scale });
@@ -120,16 +116,20 @@ export default function PdfCompressor() {
       canvas.width = pageVp.width;
       canvas.height = pageVp.height;
 
-      await page.render({ canvasContext: ctx, viewport: pageVp }).promise;
+      await page.render({
+        canvasContext: ctx,
+        viewport: pageVp,
+      }).promise;
+
       const pageImgData = canvas.toDataURL('image/jpeg', quality);
 
       const unscaledVp = page.getViewport({ scale: 1.0 });
-      const wPt = unscaledVp.width;
-      const hPt = unscaledVp.height;
-      const orient = wPt > hPt ? 'landscape' : 'portrait';
+      const widthPt = unscaledVp.width;
+      const heightPt = unscaledVp.height;
+      const orientation = widthPt > heightPt ? 'landscape' : 'portrait';
 
-      newPdf.addPage([wPt, hPt], orient);
-      newPdf.addImage(pageImgData, 'JPEG', 0, 0, wPt, hPt, undefined, 'FAST');
+      newPdf.addPage([widthPt, heightPt], orientation);
+      newPdf.addImage(pageImgData, 'JPEG', 0, 0, widthPt, heightPt, undefined, 'FAST');
       setProgress(Math.round((pageNum / totalPages) * 100));
     }
 
@@ -147,17 +147,17 @@ export default function PdfCompressor() {
 
       const buffer = await file.arrayBuffer();
 
-      const [losslessBlob, rasterBlob] = await Promise.all([
+      const [losslessBlob, calibratedBlob] = await Promise.all([
         compressLossless(buffer),
-        compressContinuous(buffer, targetSize),
+        compressWithCalibration(buffer, targetSize),
       ]);
 
       const candidates = [];
       if (losslessBlob && losslessBlob.size < file.size) {
         candidates.push(losslessBlob);
       }
-      if (rasterBlob && rasterBlob.size < file.size) {
-        candidates.push(rasterBlob);
+      if (calibratedBlob && calibratedBlob.size < file.size) {
+        candidates.push(calibratedBlob);
       }
 
       if (candidates.length === 0) {
@@ -165,6 +165,7 @@ export default function PdfCompressor() {
         return;
       }
 
+      // Pick whichever candidate is closest to the target size requested by the slider
       candidates.sort((a, b) => Math.abs(a.size - targetSize) - Math.abs(b.size - targetSize));
       const bestBlob = candidates[0];
 
@@ -217,10 +218,10 @@ export default function PdfCompressor() {
           <div className="flex justify-between items-center">
             <div className="flex items-center gap-2">
               <Sliders className="w-4 h-4 text-indigo-600" />
-              <label className="text-sm font-semibold text-slate-700">Compression Target</label>
+              <label className="text-sm font-semibold text-slate-700">Compression Strength</label>
             </div>
             <span className="text-sm font-bold text-indigo-600 bg-indigo-50 px-2.5 py-0.5 rounded-full">
-              ~{compressionRate}% reduction
+              {compressionRate}% reduction
             </span>
           </div>
 
@@ -240,15 +241,15 @@ export default function PdfCompressor() {
           />
 
           <div className="flex justify-between text-xs text-slate-400">
-            <span>Low (10%)</span>
+            <span>Light (10%)</span>
             <span>Balanced (50%)</span>
-            <span>High (90%)</span>
+            <span>Maximum (90%)</span>
           </div>
 
           <div className="pt-3 border-t border-slate-100 flex items-center justify-between text-sm">
-            <span className="text-slate-600">Target Ceiling:</span>
+            <span className="text-slate-600">Target Output Size:</span>
             <span className="font-semibold text-slate-800">
-              {file ? `≤ ${formatSize(targetSize)}` : '--'}
+              {file ? `~${formatSize(targetSize)}` : '--'}
             </span>
           </div>
         </div>
@@ -279,7 +280,7 @@ export default function PdfCompressor() {
         {result && (
           <div className="p-4 bg-emerald-50 border border-emerald-200 rounded-xl space-y-3">
             <div className="flex justify-between items-center text-sm">
-              <span className="text-emerald-900 font-medium">Compressed Size:</span>
+              <span className="text-emerald-900 font-medium">Actual Result:</span>
               <span className="font-bold text-emerald-700">
                 {formatSize(result.size)}
                 <span className="ml-2 font-normal text-xs text-emerald-600">
